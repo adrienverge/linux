@@ -1388,6 +1388,24 @@ event_sched_out(struct perf_event *event,
 	if (event->state != PERF_EVENT_STATE_ACTIVE)
 		return;
 
+	if (event->output_mode == PERF_EVENT_OUTPUT_SPLICE) {
+		struct drainlist_el drain;
+		struct ringbuffer *rb = &event->splice->ringbuf;
+
+		/* just in case */
+		if (event->oncpu < 0)
+			panic("event->oncpu < 0");
+
+		perf_bts_splice_prepare_drain(rb, event->oncpu, &drain);
+		if (rb->cur_buf[event->oncpu] >= 0 && drain.datalen > 0) {
+			drain.prog_from = FROM_SCHED;
+			drainlist_push(&event->splice->drainlist, &drain);
+
+			/* reset BTS regs to avoid a second drain */
+			config_bts_ringbuffer(rb, event->oncpu);
+		}
+	}
+
 	event->state = PERF_EVENT_STATE_INACTIVE;
 	if (event->pending_disable) {
 		event->pending_disable = 0;
@@ -1450,6 +1468,8 @@ static int __perf_remove_from_context(void *info)
 	return 0;
 }
 
+static int perf_event_set_splice_fd(struct perf_event *event,
+				    unsigned int fd);
 
 /*
  * Remove the event from a task's (or a CPU's) list of events.
@@ -1468,6 +1488,12 @@ static void perf_remove_from_context(struct perf_event *event)
 {
 	struct perf_event_context *ctx = event->ctx;
 	struct task_struct *task = ctx->task;
+
+	// TODO: is this the right place to do this?
+	if (event->output_mode == PERF_EVENT_OUTPUT_SPLICE) {
+		/* to call fdput(event->splice_fd); */
+		perf_event_set_splice_fd(event, -1);
+	}
 
 	lockdep_assert_held(&ctx->mutex);
 
@@ -1659,6 +1685,42 @@ event_sched_in(struct perf_event *event,
 	if (unlikely(event->hw.interrupts == MAX_INTERRUPTS)) {
 		perf_log_throttle(event, 1);
 		event->hw.interrupts = 0;
+	}
+
+	if (event->output_mode == PERF_EVENT_OUTPUT_SPLICE) {
+		struct ringbuffer *rb = &event->splice->ringbuf;
+		int ret;
+
+		/* just in case */
+		if (event->oncpu < 0)
+			panic("event->oncpu < 0");
+
+		/* find a new subbuffer to write to */
+		ret = ringbuffer_reserve_subbuf(rb, &rb->cur_buf[event->oncpu]);
+		if (ret == -2) {
+			/*
+			 * No more free buffer -- didn't get one.
+			 *
+			 * Attempt to force the traced process to stop
+			 * until there is a new free sub-buffer.
+			 */
+			set_tsk_need_resched(event->ctx->task);
+
+			/* generate error */
+			atomic_inc(&rb->lost);
+			/* disable it */
+			rb->cur_buf[event->oncpu] = -1;
+		} else {
+			if (ret == -1) {
+				/*
+				 * No more free buffer -- after this one.
+				 */
+				set_tsk_need_resched(event->ctx->task);
+			}
+
+			/* move to the next sub-buffer */
+			config_bts_ringbuffer(rb, event->oncpu);
+		}
 	}
 
 	/*
@@ -3599,6 +3661,9 @@ static long perf_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 	case PERF_EVENT_IOC_SET_FILTER:
 		return perf_event_set_filter(event, (void __user *)arg);
+
+	case PERF_EVENT_IOC_SET_SPLICE_FD:
+		return perf_event_set_splice_fd(event, arg);
 
 	default:
 		return -ENOTTY;
@@ -6844,6 +6909,37 @@ err_size:
 	goto out;
 }
 
+/*
+ * The goal of our new "splice" implementation is to avoid the multiple copies
+ * done by the original perf implementation (especially the one in the
+ * interrupt handler), and thus greatly reduce overhead (about half).
+ *
+ * Design:
+ *
+ * The BTS trace is stored in a per-process ring-buffer (i.e. a big memory area
+ * divided into multiple sub-buffers).  Each CPU BTS unit is configured to
+ * write in one of these sub-buffers.  In case of overflow or context switch,
+ * instead of draining this buffer to a bigger one, we configure BTS to move to
+ * the next sub-buffer.  That way, there is no urgent need to copy the BTS data
+ * to make room: this data s saved to disk later by a kernel task.
+ *
+ * Moving to the next free sub-buffer is done in two cases: overflow and
+ * context switch, i.e. intel_pmu_drain_bts_buffer() and event_sched_out().
+ * In both cases, BTS is configured to the next sub-buffer with
+ * config_bts_ringbuffer().  In case of an interrupt, the drain-to-disk work is
+ * programmed for later with schedule_work_on().  This is not done in case of
+ * a context switch because of an already taken lock.
+ * Last case: when the perf event output_mode is set to something else than
+ * "splice", drain-to-disk work is also scheduled.  This happens when the
+ * process terminates or when the user changes the output mode.  In this case
+ * perf_event_set_splice_fd is called with arg -1.
+ *
+ * When a sub-buffer should be emptied, an element is added to the drain list,
+ * and the perf_bts_drain_to_disk task is schedule to process this list
+ * (which means write the buffer contents to disk, in order, and mark these
+ * buffers as free).
+ */
+
 static int
 perf_event_set_output(struct perf_event *event, struct perf_event *output_event)
 {
@@ -6871,6 +6967,7 @@ perf_event_set_output(struct perf_event *event, struct perf_event *output_event)
 
 set:
 	mutex_lock(&event->mmap_mutex);
+
 	/* Can't redirect output if we've got an active mmap() */
 	if (atomic_read(&event->mmap_count))
 		goto unlock;
@@ -6894,6 +6991,7 @@ set:
 
 	if (old_rb) {
 		ring_buffer_put(old_rb);
+
 		/*
 		 * Since we detached before setting the new rb, so that we
 		 * could attach the new rb, we could have missed a wakeup.
@@ -6908,6 +7006,284 @@ unlock:
 
 out:
 	return ret;
+}
+
+/*
+ * TODO: one semaphore per event would be better than one for everybody
+ */
+static DEFINE_SEMAPHORE(perf_bts_drain_lock);
+
+static int __do_perf_bts_drain_to_disk(struct file *out, void *buf, size_t len)
+{
+	int res;
+
+	if (len <= 0)
+		return -EINVAL;
+
+	res = kernel_write(out, (char*) buf, len, out->f_pos);
+	if (res < 0) {
+		printk(KERN_ERR "__do_perf_bts_drain_to_disk: "
+				"kernel_write(out, buf, %x, %x) failed\n",
+		      (int) len, (int) out->f_pos);
+		return res;
+	}
+	out->f_pos += res;
+
+	return 0;
+}
+
+static void perf_bts_drain_to_disk(struct work_struct *work)
+{
+	struct perf_event_bts_splice *splice;
+	struct ringbuffer *rb;
+	struct drainlist *drainlist;
+	struct drainlist_el drain;
+
+	splice = container_of(work, struct perf_event_bts_splice, work);
+	rb = &splice->ringbuf;
+	drainlist = &splice->drainlist;
+
+	if (down_interruptible(&perf_bts_drain_lock))
+		return;
+
+	while (!drainlist_isempty(drainlist)) {
+		drainlist_pop(drainlist, &drain);
+
+		if (atomic_read(&rb->protected[drain.buf]) != 1)
+			printk(KERN_ERR "perf_bts_drain_to_disk: "
+					"NOT PROTECTED\n");
+
+		if (__do_perf_bts_drain_to_disk(splice->fd.file,
+						rb->data[drain.buf],
+						drain.datalen))
+			printk(KERN_ERR "perf_bts_drain_to_disk: "
+					"couldn't write data to file\n");
+
+		ringbuffer_unreserve_subbuf(rb, drain.buf);
+	}
+
+	up(&perf_bts_drain_lock);
+}
+
+static int drainlist_init(struct drainlist *d, int no_subbufs)
+{
+	size_t size = no_subbufs * sizeof(*d->base);
+
+	d->base = kmalloc(size, GFP_KERNEL | __GFP_ZERO);
+	if (unlikely(!d->base))
+		return -ENOMEM;
+
+	spin_lock_init(&d->lock);
+
+	d->head_r = d->base;
+	d->head_w = d->base;
+	d->end = &d->base[no_subbufs];
+
+	return 0;
+}
+
+static void drainlist_free(struct drainlist *d)
+{
+	kfree(d->base);
+}
+
+bool drainlist_isempty(struct drainlist *d)
+{
+	unsigned long flags;
+	bool ret;
+
+	spin_lock_irqsave(&d->lock, flags);
+
+	ret = (d->head_r == d->head_w);
+
+	spin_unlock_irqrestore(&d->lock, flags);
+
+	return ret;
+}
+void drainlist_push(struct drainlist *d, struct drainlist_el *el)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&d->lock, flags);
+
+	*d->head_w = *el;
+	d->head_w++;
+	if (d->head_w == d->end)
+		d->head_w = d->base;
+
+	spin_unlock_irqrestore(&d->lock, flags);
+}
+void drainlist_pop(struct drainlist *d, struct drainlist_el *el)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&d->lock, flags);
+
+	*el = *d->head_r;
+	d->head_r++;
+	if (d->head_r == d->end)
+		d->head_r = d->base;
+
+	spin_unlock_irqrestore(&d->lock, flags);
+}
+
+#if 0
+static void dump_regular_bts_conf(struct ringbuffer *rb)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		printk(KERN_INFO "CPU %2d: bts_buf @ %p\n", cpu, get_bts_buffer(cpu));
+}
+#endif
+static void save_regular_bts_conf(struct ringbuffer *rb)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		rb->backup[cpu] = get_bts_buffer(cpu);
+}
+static void restore_regular_bts_conf(struct ringbuffer *rb)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		restore_original_bts_buffer(cpu, rb->backup[cpu]);
+}
+
+static int ringbuffer_alloc(struct ringbuffer *rb)
+{
+	int cpu, buf;
+	size_t size;
+	void *base;
+
+	/*
+	 * First, we need to save the original BTS buffer location
+	 * so we can restore it once we're done.
+	 */
+	save_regular_bts_conf(rb);
+
+	/* TODO: make this runtime configurable */
+	rb->no_buf = BTS_SPLICE_NR_BUF;
+	rb->buf_size = BTS_SPLICE_BUF_SZ;
+
+#define BTS_RECORD_SIZE		24
+	/*
+	 * Must be multiple of BTS_RECORD_SIZE.
+	 * Otherwise, interrupt doesn't trigger.
+	 */
+	rb->buf_threshold = BTS_RECORD_SIZE * (rb->buf_size / BTS_RECORD_SIZE);
+
+	size = rb->no_buf * rb->buf_size;
+
+	base = kmalloc(size, GFP_KERNEL | __GFP_ZERO);
+	if (unlikely(!base))
+		return -ENOMEM;
+
+	for (buf = 0; buf < rb->no_buf; buf++) {
+		rb->data[buf] = base + buf * rb->buf_size;
+
+		ringbuffer_unreserve_subbuf(rb, buf);
+	}
+
+	for_each_possible_cpu(cpu)
+		rb->cur_buf[cpu] = -1;
+
+	atomic_set(&rb->lost, 0);
+
+	return 0;
+}
+
+static void ringbuffer_free(struct ringbuffer *rb)
+{
+	restore_regular_bts_conf(rb);
+
+	kfree(rb->data[0]);
+}
+
+static int perf_event_set_splice_fd(struct perf_event *event,
+				    unsigned int fd)
+{
+	struct perf_event_bts_splice *splice = event->splice;
+	struct fd output;
+	int err;
+
+	/*
+	 * If there already was a splice associated with this event,
+	 * release everything.
+	 */
+	if (splice) {
+		int lost = atomic_read(&splice->ringbuf.lost);
+		printk(KERN_INFO "perf BTS splice: process has been "
+				 "interrupted %d times\n", splice->no_int);
+		if (lost)
+			printk(KERN_INFO "perf BTS splice: warning: "
+					 "lost %d subbuffers\n", lost);
+
+		/*
+		 * Make sure that everything is written to disk
+		 * before closing the file descriptor
+		 */
+		flush_scheduled_work();
+		/* Process all that is left in BTS buffer */
+		perf_bts_drain_to_disk(&splice->work);
+
+		fdput(splice->fd);
+
+		drainlist_free(&splice->drainlist);
+
+		ringbuffer_free(&splice->ringbuf);
+
+		kfree(splice);
+		event->splice = NULL;
+	}
+
+	smp_wmb();
+	event->output_mode = PERF_EVENT_OUTPUT_NONE;
+
+	/* -1 means disable splice output */
+	if (fd == -1)
+		return 0;
+
+	printk(KERN_INFO "perf BTS splice: setting output to "
+			 "file descriptor %d\n", fd);
+
+	splice = kmalloc(sizeof(struct perf_event_bts_splice),
+			 GFP_KERNEL | __GFP_ZERO);
+	if (unlikely(!splice))
+		return -ENOMEM;
+
+	splice->no_int = 0;
+
+	output = fdget(fd);
+	if (unlikely(!output.file)) {
+		fdput(output);
+		return -EBADF;
+	}
+	splice->fd = output;
+
+	err = drainlist_init(&splice->drainlist, BTS_SPLICE_NR_BUF);
+	if (unlikely(err)) {
+		fdput(output);
+		return err;
+	}
+
+	err = ringbuffer_alloc(&splice->ringbuf);
+	if (unlikely(err)) {
+		drainlist_free(&splice->drainlist);
+		fdput(output);
+		return err;
+	}
+
+	INIT_WORK(&splice->work, perf_bts_drain_to_disk);
+
+	init_waitqueue_head(&splice->wait_buf_full);
+
+	event->splice = splice;
+	smp_wmb();
+	event->output_mode = PERF_EVENT_OUTPUT_SPLICE;
+
+	return 0;
 }
 
 /**
@@ -7082,6 +7458,9 @@ SYSCALL_DEFINE5(perf_event_open,
 		if (err)
 			goto err_context;
 	}
+
+	event->output_mode = PERF_EVENT_OUTPUT_REGULAR;
+	event->splice = NULL;
 
 	event_file = anon_inode_getfile("[perf_event]", &perf_fops, event, O_RDWR);
 	if (IS_ERR(event_file)) {

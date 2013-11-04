@@ -1,6 +1,7 @@
 #include <linux/bitops.h>
 #include <linux/types.h>
 #include <linux/slab.h>
+#include <linux/hardirq.h>
 
 #include <asm/perf_event.h>
 #include <asm/insn.h>
@@ -279,6 +280,45 @@ static int alloc_bts_buffer(int cpu)
 	return 0;
 }
 
+void restore_original_bts_buffer(int cpu, void *base)
+{
+	struct debug_store *ds = per_cpu(cpu_hw_events, cpu).ds;
+
+	int max = BTS_BUFFER_SIZE / BTS_RECORD_SIZE;
+	int thresh = max / 16;
+
+	ds->bts_buffer_base = (u64) base;
+	ds->bts_index = ds->bts_buffer_base;
+	ds->bts_absolute_maximum = ds->bts_buffer_base +
+		max * BTS_RECORD_SIZE;
+	ds->bts_interrupt_threshold = ds->bts_absolute_maximum -
+		thresh * BTS_RECORD_SIZE;
+}
+void *get_bts_buffer(int cpu)
+{
+	return (void *) per_cpu(cpu_hw_events, cpu).ds->bts_buffer_base;
+}
+
+int config_bts_ringbuffer(struct ringbuffer *rb, int cpu)
+{
+	struct debug_store *ds = per_cpu(cpu_hw_events, cpu).ds;
+	int buf = rb->cur_buf[cpu];
+
+	if (!x86_pmu.bts)
+		return 0;
+
+	if (buf < 0)
+		return 1;
+
+	ds->bts_buffer_base = (u64) rb->data[0];
+	ds->bts_index = (u64) rb->data[buf];
+	ds->bts_interrupt_threshold = ds->bts_index + rb->buf_threshold;
+	ds->bts_absolute_maximum = ds->bts_buffer_base +
+				   rb->no_buf * rb->buf_size;
+
+	return 0;
+}
+
 static void release_bts_buffer(int cpu)
 {
 	struct debug_store *ds = per_cpu(cpu_hw_events, cpu).ds;
@@ -439,6 +479,20 @@ void intel_pmu_disable_bts(void)
 	update_debugctlmsr(debugctlmsr);
 }
 
+/*
+ * ds->bts_index should never overflow the subbuffer size.
+ * Set the threshold interrupt so as it never happens.
+ * Else, subbase would have a wrong value.
+ */
+void perf_bts_splice_prepare_drain(struct ringbuffer *rb, int cpu, struct drainlist_el *drain)
+{
+	struct debug_store *ds = per_cpu(cpu_hw_events, cpu).ds;
+
+	drain->cpu = cpu;
+	drain->buf = rb->cur_buf[cpu];
+	drain->datalen = ds->bts_index - (unsigned long) rb->data[drain->buf];
+}
+
 int intel_pmu_drain_bts_buffer(void)
 {
 	struct cpu_hw_events *cpuc = &__get_cpu_var(cpu_hw_events);
@@ -450,10 +504,12 @@ int intel_pmu_drain_bts_buffer(void)
 	};
 	struct perf_event *event = cpuc->events[INTEL_PMC_IDX_FIXED_BTS];
 	struct bts_record *at, *top;
+	size_t len;
 	struct perf_output_handle handle;
 	struct perf_event_header header;
 	struct perf_sample_data data;
 	struct pt_regs regs;
+	int cpu;
 
 	if (!event)
 		return 0;
@@ -461,36 +517,95 @@ int intel_pmu_drain_bts_buffer(void)
 	if (!x86_pmu.bts_active)
 		return 0;
 
+	if (event->output_mode == PERF_EVENT_OUTPUT_NONE)
+		return 1;
+
 	at  = (struct bts_record *)(unsigned long)ds->bts_buffer_base;
 	top = (struct bts_record *)(unsigned long)ds->bts_index;
+	len = (unsigned long) ds->bts_index - ds->bts_buffer_base;
 
 	if (top <= at)
 		return 0;
 
-	memset(&regs, 0, sizeof(regs));
+	if (event->output_mode == PERF_EVENT_OUTPUT_SPLICE) {
+		struct ringbuffer *rb;
+		struct drainlist_el drain;
 
-	ds->bts_index = ds->bts_buffer_base;
+		smp_rmb();
 
-	perf_sample_data_init(&data, 0, event->hw.last_period);
+		rb = &event->splice->ringbuf;
 
-	/*
-	 * Prepare a generic sample, i.e. fill in the invariant fields.
-	 * We will overwrite the from and to address before we output
-	 * the sample.
-	 */
-	perf_prepare_sample(&header, &data, event, &regs);
+		if (in_interrupt())
+			event->splice->no_int++;
 
-	if (perf_output_begin(&handle, event, header.size * (top - at)))
-		return 1;
+		cpu = get_cpu();
 
-	for (; at < top; at++) {
-		data.ip		= at->from;
-		data.addr	= at->to;
+		perf_bts_splice_prepare_drain(rb, cpu, &drain);
+		drain.prog_from = FROM_INT;
 
-		perf_output_sample(&handle, &header, &data, event);
+		if (rb->cur_buf[cpu] >= 0 && drain.datalen > 0) {
+			int ret;
+
+			drainlist_push(&event->splice->drainlist, &drain);
+
+			if (in_interrupt())
+				schedule_work_on(cpu, &event->splice->work);
+
+			/* find a new subbuffer to write to */
+			ret = ringbuffer_reserve_subbuf(rb, &rb->cur_buf[cpu]);
+			if (ret == -2) {
+				/*
+				 * No more free buffer -- didn't get one.
+				 *
+				 * Attempt to force the traced process to stop
+				 * until there is a new free sub-buffer.
+				 */
+				set_tsk_need_resched(event->ctx->task);
+
+				/* generate error */
+				atomic_inc(&rb->lost);
+				/* disable it */
+				rb->cur_buf[cpu] = -1;
+			} else {
+				if (ret == -1) {
+					/*
+					 * No more free buffer -- after this one.
+					 */
+					set_tsk_need_resched(event->ctx->task);
+				}
+
+				/* move to the next sub-buffer */
+				config_bts_ringbuffer(rb, cpu);
+			}
+		}
+
+		put_cpu();
+	} else if (event->output_mode == PERF_EVENT_OUTPUT_REGULAR) {
+		memset(&regs, 0, sizeof(regs));
+
+		ds->bts_index = ds->bts_buffer_base;
+
+		perf_sample_data_init(&data, 0, event->hw.last_period);
+
+		/*
+		 * Prepare a generic sample, i.e. fill in the invariant fields.
+		 * We will overwrite the from and to address before we output
+		 * the sample.
+		 */
+		perf_prepare_sample(&header, &data, event, &regs);
+
+		if (perf_output_begin(&handle, event, header.size * (top - at)))
+			return 1;
+
+		for (; at < top; at++) {
+			data.ip		= at->from;
+			data.addr	= at->to;
+
+			perf_output_sample(&handle, &header, &data, event);
+		}
+
+		perf_output_end(&handle);
 	}
-
-	perf_output_end(&handle);
 
 	/* There's new data available. */
 	event->hw.interrupts++;

@@ -52,6 +52,7 @@ struct perf_guest_info_callbacks {
 #include <linux/atomic.h>
 #include <linux/sysfs.h>
 #include <linux/perf_regs.h>
+#include <linux/file.h>
 #include <asm/local.h>
 
 struct perf_callchain_entry {
@@ -289,6 +290,117 @@ struct swevent_hlist {
 struct perf_cgroup;
 struct ring_buffer;
 
+/*
+ * In our new "splice" implementation, the BTS trace is stored in a global
+ * ring-buffer.  Each sub-buffer has the same size as the per-core BTS buffers
+ * in the original implementation (16 pages, or 64K).  The number of
+ * sub-buffers is chosen to keep as much allocated resources as perf does
+ * in its original implementation.  Perf allocated 16 pages (64K) of kernel-
+ * space memory per core, plus 128 mmap-pages (512K) per user-space program per
+ * core.  Our "splice" implementation allocates a global ring-buffer, whose
+ * size is 128 pages * number of cores.
+ *
+ * Our test machine is:
+ *	Intel i7-3770
+ *	4 physical / 8 virtual CPUs
+ *	L2: 256K / CPU (64 pages)
+ *
+ * This gives: 128 pages * 8
+ *	    == 64 sub-buffers * 16 pages
+ */
+
+#define BTS_SPLICE_BUF_SZ	(16 * PAGE_SIZE)
+#define BTS_SPLICE_NR_BUF	(8 * (128 / 16))
+
+struct ringbuffer {
+	size_t		no_buf;		/* number of sub-buffers (total) */
+	size_t		buf_size;	/* sub-buffers size */
+	size_t		buf_threshold;	/* interrupt threshold */
+
+	atomic_t	lost;		/* lost data count */
+
+	/* current used sub-buffer (per-CPU) */
+	int		cur_buf[NR_CPUS];
+	atomic_t	protected[BTS_SPLICE_NR_BUF];
+	void		*data[BTS_SPLICE_NR_BUF];
+
+	/* to save original perf BTS buffers */
+	void		*backup[NR_CPUS];
+};
+
+/*
+ * Returns -1 if no more free sub-buffer remaining after the assignment,
+ * returns -2 if no more free sub-buffer remaining now.
+ */
+static inline int ringbuffer_reserve_subbuf(struct ringbuffer *rb, int *buf)
+{
+	int b;
+
+	for (b = 0; b < rb->no_buf; b++)
+		if (atomic_add_unless(&rb->protected[b], 1, 1)) {
+			*buf = b;
+			if (b == rb->no_buf - 1)
+				return -1;
+			return 0;
+		}
+
+	return -2;
+}
+static inline void ringbuffer_unreserve_subbuf(struct ringbuffer *rb, int buf)
+{
+	atomic_set(&rb->protected[buf], 0);
+}
+
+void *get_bts_buffer(int);
+void restore_original_bts_buffer(int, void *);
+
+int config_bts_ringbuffer(struct ringbuffer *, int);
+struct drainlist_el;
+void perf_bts_splice_prepare_drain(struct ringbuffer *, int,
+				   struct drainlist_el *);
+
+/*
+ * A per-event list contains all subbuffers that are waiting
+ * to be drained, and keep them in order.
+ */
+struct drainlist_el {
+	int	cpu;		/* CPU the ringbuffer is allocated on */
+	int	buf;		/* sub-buffer number in the ringbuffer */
+	size_t	datalen;	/* data length in the sub-buffer */
+
+	enum { FROM_NONE, FROM_INT, FROM_SCHED }
+		prog_from;	/* where was it programmed from ? */
+};
+struct drainlist {
+	spinlock_t		lock;
+	struct drainlist_el	*base,
+				*head_r,
+				*head_w,
+				*end;
+};
+bool drainlist_isempty(struct drainlist *);
+void drainlist_push(struct drainlist *, struct drainlist_el *);
+void drainlist_pop(struct drainlist *, struct drainlist_el *);
+
+/*
+ * Where should the trace be written to?
+ * Keep PERF_EVENT_OUTPUT_REGULAR for the original implementation.
+ */
+enum perf_event_output_mode {
+	PERF_EVENT_OUTPUT_REGULAR,
+	PERF_EVENT_OUTPUT_NONE,
+	PERF_EVENT_OUTPUT_SPLICE,
+};
+
+struct perf_event_bts_splice {
+	struct fd			fd;
+	struct work_struct		work;
+	struct ringbuffer		ringbuf;
+	struct drainlist		drainlist;
+	int				no_int;
+	wait_queue_head_t		wait_buf_full;
+};
+
 /**
  * struct perf_event - performance event kernel representation:
  */
@@ -435,6 +547,10 @@ struct perf_event {
 	struct perf_cgroup		*cgrp; /* cgroup event is attach to */
 	int				cgrp_defer_enabled;
 #endif
+
+	enum perf_event_output_mode	output_mode;
+	struct perf_event_bts_splice	*splice; /* used when output_mode ==
+						    PERF_EVENT_OUTPUT_SPLICE */
 
 #endif /* CONFIG_PERF_EVENTS */
 };
