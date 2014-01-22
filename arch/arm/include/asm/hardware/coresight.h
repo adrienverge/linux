@@ -95,8 +95,8 @@
 #define ETMAAT_NSONLY		(1 << 10)
 #define ETMAAT_SONLY		(2 << 10)
 
-#define ETMR_COMP_VAL(x)	(0x40 + (x) * 4)
-#define ETMR_COMP_ACC_TYPE(x)	(0x80 + (x) * 4)
+#define ETMR_ADDRCOMP_VAL(x)	(0x40 + (x) * 4)
+#define ETMR_ADDRCOMP_ACC_TYPE(x)	(0x80 + (x) * 4)
 
 /* ETM status register, "ETM Architecture", 3.3.2 */
 #define ETMR_STATUS		(0x10)

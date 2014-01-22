@@ -39,7 +39,7 @@ struct tracectx {
 	void __iomem	*etb_regs;
 	void __iomem	*etm_regs;
 	unsigned long	flags;
-	int		ncmppairs;
+	int		naddrcmppairs;
 	int		etm_portsz;
 	struct device	*dev;
 	struct clk	*emu_clk;
@@ -59,7 +59,7 @@ static int etm_setup_address_range(struct tracectx *t, int n,
 	u32 flags = ETMAAT_ARM | ETMAAT_IGNCONTEXTID | ETMAAT_NSONLY | \
 		    ETMAAT_NOVALCMP;
 
-	if (n < 1 || n > t->ncmppairs)
+	if (n < 1 || n > t->naddrcmppairs)
 		return -EINVAL;
 
 	/* comparators and ranges are numbered starting with 1 as opposed
@@ -72,12 +72,12 @@ static int etm_setup_address_range(struct tracectx *t, int n,
 		flags |= ETMAAT_IEXEC;
 
 	/* first comparator for the range */
-	etm_writel(t, flags, ETMR_COMP_ACC_TYPE(n * 2));
-	etm_writel(t, start, ETMR_COMP_VAL(n * 2));
+	etm_writel(t, flags, ETMR_ADDRCOMP_ACC_TYPE(n * 2));
+	etm_writel(t, start, ETMR_ADDRCOMP_VAL(n * 2));
 
 	/* second comparator is right next to it */
-	etm_writel(t, flags, ETMR_COMP_ACC_TYPE(n * 2 + 1));
-	etm_writel(t, end, ETMR_COMP_VAL(n * 2 + 1));
+	etm_writel(t, flags, ETMR_ADDRCOMP_ACC_TYPE(n * 2 + 1));
+	etm_writel(t, end, ETMR_ADDRCOMP_VAL(n * 2 + 1));
 
 	flags = exclude ? ETMTE_INCLEXCL : 0;
 	etm_writel(t, flags | (1 << n), ETMR_TRACEENCTRL);
@@ -478,7 +478,8 @@ static ssize_t trace_info_show(struct device *dev,
 	etm_st = etm_readl(&tracer, ETMR_STATUS);
 	etm_lock(&tracer);
 
-	return sprintf(buf, "Trace buffer len: %d\nComparator pairs: %d\n"
+	return sprintf(buf, "Trace buffer len: %d\n"
+			"Addr comparator pairs: %d\n"
 			"ETBR_WRITEADDR:\t%08x\n"
 			"ETBR_READADDR:\t%08x\n"
 			"ETBR_STATUS:\t%08x\n"
@@ -486,7 +487,7 @@ static ssize_t trace_info_show(struct device *dev,
 			"ETMR_CTRL:\t%08x\n"
 			"ETMR_STATUS:\t%08x\n",
 			datalen,
-			tracer.ncmppairs,
+			tracer.naddrcmppairs,
 			etb_wa,
 			etb_ra,
 			etb_st,
@@ -562,7 +563,7 @@ static int etm_probe(struct amba_device *dev, const struct amba_id *id)
 	/* dummy first read */
 	(void)etm_readl(&tracer, ETMMR_OSSRR);
 
-	t->ncmppairs = etm_readl(t, ETMR_CONFCODE) & 0xf;
+	t->naddrcmppairs = etm_readl(t, ETMR_CONFCODE) & 0xf;
 	etm_writel(t, 0x440, ETMR_CTRL);
 	etm_lock(t);
 
