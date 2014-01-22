@@ -275,7 +275,7 @@ static ssize_t etb_read(struct file *file, char __user *data,
 	long length;
 	struct tracectx *t = file->private_data;
 	u32 first = 0;
-	u32 *buf;
+	u32 *buf = NULL;
 
 	mutex_lock(&t->mutex);
 
@@ -293,12 +293,14 @@ static ssize_t etb_read(struct file *file, char __user *data,
 	etb_writel(t, first, ETBR_READADDR);
 
 	length = min(total * 4, (int)len);
-	buf = vmalloc(length);
+	if (length != 0)
+		buf = vmalloc(length);
 
 	dev_dbg(t->dev, "ETB buffer length: %d\n", total);
 	dev_dbg(t->dev, "ETB status reg: %x\n", etb_readl(t, ETBR_STATUS));
-	for (i = 0; i < length / 4; i++)
-		buf[i] = etb_readl(t, ETBR_READMEM);
+	if (buf)
+		for (i = 0; i < length / 4; i++)
+			buf[i] = etb_readl(t, ETBR_READMEM);
 
 	/* the only way to deassert overflow bit in ETB status is this */
 	etb_writel(t, 1, ETBR_CTRL);
@@ -311,7 +313,8 @@ static ssize_t etb_read(struct file *file, char __user *data,
 	etb_lock(t);
 
 	length -= copy_to_user(data, buf, length);
-	vfree(buf);
+	if (buf)
+		vfree(buf);
 
 out:
 	mutex_unlock(&t->mutex);
