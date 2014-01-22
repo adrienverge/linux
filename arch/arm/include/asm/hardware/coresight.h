@@ -98,6 +98,11 @@
 #define ETMR_ADDRCOMP_VAL(x)	(0x40 + (x) * 4)
 #define ETMR_ADDRCOMP_ACC_TYPE(x)	(0x80 + (x) * 4)
 
+#ifdef CONFIG_PID_IN_CONTEXTIDR
+#define ETMR_CTXIDCOMP_VAL(x)	(0x1b0 + (x) * 4)
+#define ETMR_CTXIDCOMP_MASK	(0x1bc)
+#endif
+
 /* ETM status register, "ETM Architecture", 3.3.2 */
 #define ETMR_STATUS		(0x10)
 #define ETMST_OVERFLOW		BIT(0)
